@@ -7,6 +7,7 @@ from unittest import mock
 
 from freezegun import freeze_time
 from odoo_test_helper import FakeModelLoader
+from psycopg2 import OperationalError
 
 from odoo import fields, tools
 from odoo.exceptions import UserError
@@ -15,43 +16,32 @@ from .common import EDIBackendCommonTestCase
 
 
 class EDIBackendTestOutputCase(EDIBackendCommonTestCase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-
-        vals = {
-            "model": cls.partner._name,
-            "res_id": cls.partner.id,
-        }
-        cls.record = cls.backend.create_record("test_csv_output", vals)
-
-    @classmethod
-    def _setup_records(cls):  # pylint:disable=missing-return
-        super()._setup_records()
-        # Load fake models ->/
-        cls.loader = FakeModelLoader(cls.env, cls.__module__)
-        cls.loader.backup_registry()
-        from .fake_models import EdiTestExecution
-
-        cls.loader.update_registry((EdiTestExecution,))
-        cls.ExecutionAbstractModel = cls.env["edi.framework.test.execution"]
-        cls.model = cls.env["ir.model"].search(
-            [("model", "=", "edi.framework.test.execution")]
-        )
-        cls.exchange_type_out.generate_model_id = cls.model
-        cls.exchange_type_out.send_model_id = cls.model
-        cls.exchange_type_out.output_validate_model_id = cls.model
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.loader.restore_registry()
-        super().tearDownClass()
-
     def setUp(self):
         super().setUp()
+        self.loader = FakeModelLoader(self.env, self.__module__)
+        self.loader.backup_registry()
+        from .fake_models import EdiTestExecution
+
+        self.loader.update_registry((EdiTestExecution,))
+        self.ExecutionAbstractModel = self.env["edi.framework.test.execution"]
+        self.model = self.env["ir.model"].search(
+            [("model", "=", "edi.framework.test.execution")]
+        )
+        self.exchange_type_out.generate_model_id = self.model
+        self.exchange_type_out.send_model_id = self.model
+        self.exchange_type_out.output_validate_model_id = self.model
+        vals = {
+            "model": self.partner._name,
+            "res_id": self.partner.id,
+        }
+        self.record = self.backend.create_record("test_csv_output", vals)
         self.ExecutionAbstractModel.reset_faked("generate")
         self.ExecutionAbstractModel.reset_faked("send")
         self.ExecutionAbstractModel.reset_faked("check")
+
+    def tearDown(self):
+        self.loader.restore_registry()
+        super().tearDown()
 
     def test_generate_record_output(self):
         self.record.with_context(fake_output="yeah!").action_exchange_generate()
@@ -103,6 +93,17 @@ class EDIBackendTestOutputCase(EDIBackendCommonTestCase):
             "OOPS! Something went wrong :(", self.record.exchange_error_traceback
         )
 
+    def test_send_record_with_error_triggers_notify_error(self):
+        self.record.write({"edi_exchange_state": "output_pending"})
+        self.record._set_file_content(f"TEST {self.record.id}")
+        conf = self._make_global_error_conf(self.record.type_id)
+        self.record.with_context(
+            test_break_send="OOPS! Something went wrong :("
+        ).action_exchange_send()
+        # The error event must fire so downstream notifications (e.g.
+        # edi_notification_oca activities) are triggered.
+        self.assertEqual(conf.description, "error-event-fired")
+
     def test_send_invalid_direction(self):
         vals = {
             "model": self.partner._name,
@@ -133,3 +134,13 @@ class EDIBackendTestOutputCase(EDIBackendCommonTestCase):
                 err.exception.args[0], "Record ID=%d has no file to send!" % record.id
             )
             mocked.assert_not_called()
+
+    def test_send_record_with_operational_error(self):
+        self.record.write({"edi_exchange_state": "output_pending"})
+        self.record._set_file_content("TEST %d" % self.record.id)
+        with self.assertRaises(OperationalError):
+            self.backend.with_context(
+                test_break_send=OperationalError("SQL error")
+            ).exchange_send(self.record)
+        self.assertRecordValues(self.record, [{"edi_exchange_state": "output_pending"}])
+        self.assertFalse(self.record.exchange_error)

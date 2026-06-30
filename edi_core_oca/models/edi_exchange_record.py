@@ -113,6 +113,7 @@ class EDIExchangeRecord(models.Model):
     parent_id = fields.Many2one(
         comodel_name="edi.exchange.record",
         help="Original exchange which originated this record",
+        index=True,
     )
     related_exchange_ids = fields.One2many(
         string="Related exchanges",
@@ -133,6 +134,7 @@ class EDIExchangeRecord(models.Model):
         help="ACK generated for current exchange.",
         compute="_compute_ack_exchange_id",
         store=True,
+        index=True,
     )
     ack_received_on = fields.Datetime(
         string="ACK received on", related="ack_exchange_id.exchanged_on"
@@ -142,6 +144,7 @@ class EDIExchangeRecord(models.Model):
         help="The record state can be rolled back manually in case of failure.",
     )
     company_id = fields.Many2one("res.company", string="Company")
+    active = fields.Boolean(default=True)
 
     _sql_constraints = [
         ("identifier_uniq", "unique(identifier)", "The identifier must be unique."),
@@ -379,10 +382,11 @@ class EDIExchangeRecord(models.Model):
         # The backend already knows how to handle records
         # according to their direction and status.
         # Let it decide.
+        backend = self.backend_id.with_context(edi__quick_exec=True)
         if self.type_id.direction == "output":
-            self.backend_id._check_output_exchange_sync(record_ids=self.ids)
+            backend._check_output_exchange_sync(record_ids=self.ids)
         else:
-            self.backend_id._check_input_exchange_sync(record_ids=self.ids)
+            backend._check_input_exchange_sync(record_ids=self.ids)
 
     @api.constrains("backend_id", "type_id")
     def _constrain_backend(self):
@@ -529,8 +533,19 @@ class EDIExchangeRecord(models.Model):
             rec._notify_related_record(message, level)
 
     def _trigger_edi_event(self, name, suffix=None, target=None, **kw):
-        """Hook to be implemented in other modules"""
-        pass
+        event_name = self._trigger_edi_event_make_name(name, suffix)
+        target = target or self
+        global_configs = self.env["edi.configuration"].edi_get_conf_global(
+            self, event_name
+        )
+        for conf in global_configs:
+            conf.edi_exec_snippet_do(target, **kw)
+
+    def _trigger_edi_event_make_name(self, name, suffix=None):
+        return "on_edi_exchange_{name}{suffix}".format(
+            name=name,
+            suffix=("_" + suffix) if suffix else "",
+        )
 
     def _notify_done(self):
         self._notify_related_record(self._exchange_status_message("process_ok"))
@@ -635,8 +650,6 @@ class EDIExchangeRecord(models.Model):
             extend_ids = list(extend_query)
             result.extend(extend_ids[: limit - len(result)])
 
-        # Restore original ordering
-        result = [x for x in orig_ids if x in result]
         if set(orig_ids) != set(result):
             # Create a virgin query
             query = self.browse(result)._as_query()
